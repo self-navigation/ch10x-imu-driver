@@ -42,6 +42,8 @@ from geometry_msgs.msg import Vector3Stamped
 from std_msgs.msg import Header
 
 import math
+import queue
+import threading
 
 # -----------------------------------------------------------------------------
 # Protocol constants
@@ -303,45 +305,67 @@ class CH100ImuNode(Node):
             self.get_logger().fatal(f"Failed to open serial port: {e}")
             raise
 
-        # -- Frame decoder (state machine — persists across timer callbacks) --
+        # -- Frame decoder (state machine — owned by the reader thread) --
         self.decoder_ = HipnucDecoder()
 
         # -- Statistics --
         self.frames_ok_ = 0
         self.frames_bad_ = 0
 
-        # -- Timer-driven read loop (runs at ~1 kHz, i.e., faster than 400 Hz ODR) --
-        self.timer_ = self.create_timer(0.001, self.read_and_publish)
+        # -- Thread-safe queue: reader thread → ROS executor --------------
+        # Each entry is a (payload: bytes, stamp: Time) tuple, stamped at
+        # the moment the complete frame was decoded in the reader thread,
+        # as close to receipt as possible.
+        self._frame_queue = queue.SimpleQueue()
+
+        # -- Stop event — set by destroy_node() to unblock the reader thread --
+        self._stop_event = threading.Event()
+
+        # -- Serial reader thread ------------------------------------------
+        # Blocks on serial_.read(1) which releases the GIL, so the ROS
+        # executor continues running freely in the main thread.
+        self._reader_thread = threading.Thread(
+            target=self._serial_reader,
+            name="ch100_serial_reader",
+            daemon=True,
+        )
+        self._reader_thread.start()
+
+        # -- Publisher timer — drains the frame queue in the executor thread --
+        # Period is set to match the maximum ODR (400 Hz → 2.5 ms).
+        self.timer_ = self.create_timer(0.0025, self._publish_pending)
 
         self.get_logger().info("CH100 IMU node started.")
 
     # --------------------------------------------------------------------------
-    def read_and_publish(self):
+    def _serial_reader(self):
         """
-        Called by the ROS timer every 1 ms.
+        Runs in a dedicated background thread for the lifetime of the node.
 
-        Reads all bytes currently waiting in the OS serial buffer and feeds
-        them through the HipnucDecoder state machine one byte at a time.
-        A single timer tick may produce zero, one, or multiple complete frames
-        (e.g., after a brief scheduling delay that let bytes pile up).
+        Reads the serial port one byte at a time and feeds each byte into the
+        HipnucDecoder state machine.  serial_.read(1) blocks until a byte
+        arrives, releasing the GIL so the ROS executor runs freely in the
+        main thread.
+
+        When a complete, CRC-verified frame is decoded, the payload and a ROS
+        timestamp taken at that moment are pushed onto _frame_queue for the
+        publisher timer to consume.
         """
-        try:
-            available = self.serial_.in_waiting
-            if available == 0:
-                return
+        while not self._stop_event.is_set():
+            try:
+                data = self.serial_.read(1)
+                if not data:
+                    continue  # read timeout (serial timeout=1.0 s) — loop and recheck
 
-            chunk = self.serial_.read(available)
-
-            for byte in chunk:
-                payload = self.decoder_.input(byte)
-
+                payload = self.decoder_.input(data[0])
                 if payload is None:
                     continue  # state machine still accumulating
 
                 # -- Complete, CRC-verified frame --------------------------
+                # Timestamp taken here, as close to receipt as possible.
+                stamp = self.get_clock().now().to_msg()
+
                 if len(payload) != PAYLOAD_SIZE:
-                    # Unexpected payload length — decoder accepted it but it
-                    # doesn't match the 0x91 packet size we know how to parse
                     self.get_logger().warn(
                         f"Unexpected payload length {len(payload)}, "
                         f"expected {PAYLOAD_SIZE} — skipping."
@@ -356,23 +380,38 @@ class CH100ImuNode(Node):
                     self.frames_bad_ += 1
                     continue
 
-                # Parse fields and publish all topics with the same stamp
-                data = parse_payload(payload)
-                now = self.get_clock().now().to_msg()
-                self._publish_imu(data, now)
-                self._publish_mag(data, now)
-                self._publish_pressure(data, now)
-                if self.pub_euler_:
-                    self._publish_euler(data, now)
+                self._frame_queue.put((payload, stamp))
 
-                self.frames_ok_ += 1
-                if self.frames_ok_ % 500 == 0:
-                    self.get_logger().info(
-                        f"Frames OK: {self.frames_ok_}  Bad: {self.frames_bad_}"
-                    )
+            except serial.SerialException as e:
+                if not self._stop_event.is_set():
+                    self.get_logger().error(f"Serial error in reader thread: {e}")
+                break
 
-        except serial.SerialException as e:
-            self.get_logger().error(f"Serial error: {e}")
+    # --------------------------------------------------------------------------
+    def _publish_pending(self):
+        """
+        Called by the ROS timer in the executor thread every 2.5 ms.
+
+        Drains all frames that the reader thread has queued since the last
+        tick and publishes them.  Under normal operation at ≤400 Hz this
+        processes exactly one frame per call; after a scheduling hiccup it
+        may process several.
+        """
+        while not self._frame_queue.empty():
+            payload, stamp = self._frame_queue.get()
+
+            data = parse_payload(payload)
+            self._publish_imu(data, stamp)
+            self._publish_mag(data, stamp)
+            self._publish_pressure(data, stamp)
+            if self.pub_euler_:
+                self._publish_euler(data, stamp)
+
+            self.frames_ok_ += 1
+            if self.frames_ok_ % 500 == 0:
+                self.get_logger().info(
+                    f"Frames OK: {self.frames_ok_}  Bad: {self.frames_bad_}"
+                )
 
     # --------------------------------------------------------------------------
     def _make_header(self, stamp) -> Header:
@@ -441,7 +480,12 @@ class CH100ImuNode(Node):
 
     # --------------------------------------------------------------------------
     def destroy_node(self):
-        """Clean up the serial port on shutdown."""
+        """Clean up the reader thread and serial port on shutdown."""
+        # Signal the reader thread to stop, then wait for it to exit.
+        # The thread unblocks within serial timeout (1.0 s) at most.
+        self._stop_event.set()
+        if hasattr(self, "_reader_thread"):
+            self._reader_thread.join(timeout=2.0)
         if hasattr(self, "serial_") and self.serial_.is_open:
             self.serial_.close()
             self.get_logger().info("Serial port closed.")
