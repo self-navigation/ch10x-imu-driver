@@ -45,6 +45,8 @@ import math
 import queue
 import threading
 
+from rclpy.time import Time
+
 # -----------------------------------------------------------------------------
 # Protocol constants
 # -----------------------------------------------------------------------------
@@ -256,6 +258,99 @@ def parse_payload(payload: bytes) -> dict:
 
 
 # -----------------------------------------------------------------------------
+# Hardware clock synchroniser
+# -----------------------------------------------------------------------------
+class HwClockSync:
+    """
+    Maps the IMU's internal millisecond counter to ROS wall-clock time.
+
+    The IMU reports a uint32 'system_time' field (ms since power-on) that
+    increments at a rate governed by its own crystal oscillator.  This clock
+    is precise (low jitter) but its frequency differs from the host CPU clock
+    by up to ±50 ppm, so a naive one-shot offset computed at startup drifts
+    by up to ~4 ms/min.
+
+    Strategy — offset EMA with a residual gate:
+
+      offset_ns  =  ros_now_ns  −  hw_ns          (new observation)
+      filtered   +=  α × (offset_ns − filtered)   (EMA update)
+      stamp      =  hw_ns + filtered
+
+    The EMA smooths per-frame OS scheduling jitter while tracking the slow
+    crystal frequency error.  The residual gate skips the EMA update when
+    the residual exceeds one nominal frame period: this protects the estimate
+    against moments when the serial byte sat in the OS buffer longer than
+    usual (high-latency reads), which would otherwise bias the offset high.
+
+    Wraparound: uint32 ms wraps at 2^32 ms ≈ 49.7 days.  Detected by
+    checking whether hw_ms jumped backwards by more than 1 second relative
+    to the previous frame.
+    """
+
+    # EMA coefficient — time constant ≈ 1/α frames.
+    # At 100 Hz → ~5 s settling; at 400 Hz → ~1.25 s settling.
+    _ALPHA = 0.002
+
+    # Skip EMA update if the observed offset deviates from the filtered value
+    # by more than this — indicates high serial-read latency, not true drift.
+    _MAX_RESIDUAL_NS = 5_000_000    # 5 ms
+
+    # uint32 ms counter full range in nanoseconds (for wraparound compensation)
+    _WRAP_PERIOD_NS = (1 << 32) * 1_000_000
+
+    def __init__(self):
+        self._filtered_offset_ns: float | None = None
+        self._prev_hw_ms: int = 0
+        self._wrap_count: int = 0
+
+    def stamp_ns(self, hw_ms: int, ros_now_ns: int) -> int:
+        """
+        Returns a corrected ROS timestamp in nanoseconds.
+
+        hw_ms      — raw uint32 millisecond counter from the IMU payload
+        ros_now_ns — result of node.get_clock().now().nanoseconds, taken
+                     immediately after the last byte of the frame was decoded
+        """
+        # -- Wraparound detection -----------------------------------------
+        # Consecutive frames are at most a few ms apart, so a backwards jump
+        # of more than 1 second can only mean the uint32 counter wrapped.
+        if self._prev_hw_ms > 0 and hw_ms < self._prev_hw_ms - 1000:
+            self._wrap_count += 1
+        self._prev_hw_ms = hw_ms
+
+        hw_ns = hw_ms * 1_000_000 + self._wrap_count * self._WRAP_PERIOD_NS
+
+        # -- Bootstrap on first frame -------------------------------------
+        if self._filtered_offset_ns is None:
+            self._filtered_offset_ns = float(ros_now_ns - hw_ns)
+            return ros_now_ns   # first frame: use wall clock directly
+
+        # -- EMA update with residual gate --------------------------------
+        observed_offset = ros_now_ns - hw_ns
+        residual = observed_offset - self._filtered_offset_ns
+        if abs(residual) < self._MAX_RESIDUAL_NS:
+            self._filtered_offset_ns += self._ALPHA * residual
+
+        return hw_ns + int(self._filtered_offset_ns)
+
+
+# -----------------------------------------------------------------------------
+# Hardware timestamp extraction helper
+# -----------------------------------------------------------------------------
+# timestamp_ms sits at payload byte offset 8 in the 0x91 packet:
+#   B(1) + H(2) + b(1) + f(4) = 8 bytes before the uint32 field.
+# Extracted here without a full struct.unpack so the reader thread
+# can timestamp frames before the payload is fully parsed.
+_HW_TS_OFFSET = struct.calcsize("<BHbf")   # == 8
+_HW_TS_FMT    = struct.Struct("<I")        # uint32, little-endian
+
+
+def _extract_hw_ms(payload: bytes) -> int:
+    """Return the raw uint32 millisecond timestamp from a 0x91 payload."""
+    return _HW_TS_FMT.unpack_from(payload, _HW_TS_OFFSET)[0]
+
+
+# -----------------------------------------------------------------------------
 # ROS2 Node
 # -----------------------------------------------------------------------------
 class CH100ImuNode(Node):
@@ -307,6 +402,11 @@ class CH100ImuNode(Node):
 
         # -- Frame decoder (state machine — owned by the reader thread) --
         self.decoder_ = HipnucDecoder()
+
+        # -- Hardware clock synchroniser ----------------------------------
+        # Maps the IMU's internal ms counter to ROS time via a calibrated
+        # offset with EMA drift tracking.  See HwClockSync for details.
+        self._hw_clock_sync = HwClockSync()
 
         # -- Statistics --
         self.frames_ok_ = 0
@@ -362,8 +462,11 @@ class CH100ImuNode(Node):
                     continue  # state machine still accumulating
 
                 # -- Complete, CRC-verified frame --------------------------
-                # Timestamp taken here, as close to receipt as possible.
-                stamp = self.get_clock().now().to_msg()
+                # Wall-clock sample taken immediately after the last byte was
+                # decoded — as close to receipt as possible.  Passed to
+                # HwClockSync together with the IMU's own hardware timestamp
+                # to produce a corrected, jitter-filtered ROS stamp.
+                ros_now_ns = self.get_clock().now().nanoseconds
 
                 if len(payload) != PAYLOAD_SIZE:
                     self.get_logger().warn(
@@ -380,6 +483,9 @@ class CH100ImuNode(Node):
                     self.frames_bad_ += 1
                     continue
 
+                hw_ms = _extract_hw_ms(payload)
+                corrected_ns = self._hw_clock_sync.stamp_ns(hw_ms, ros_now_ns)
+                stamp = Time(nanoseconds=corrected_ns).to_msg()
                 self._frame_queue.put((payload, stamp))
 
             except serial.SerialException as e:
