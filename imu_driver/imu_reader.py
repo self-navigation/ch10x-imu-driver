@@ -4,10 +4,10 @@ CH100 IMU ROS2 Driver Node
 (With updates from C++ upstream https://github.com/hipnuc/products/tree/dddc5d46add235d848d860a326eab8ee5f66c919/examples/ROS2)
 
 Reads binary 0x91 IMUSOL frames from the CH100 over serial and publishes:
-  - /imu/data          (sensor_msgs/Imu)        — quaternion, angular vel, linear accel
-  - /imu/mag           (sensor_msgs/MagneticField) — magnetometer XYZ
-  - /imu/pressure      (sensor_msgs/FluidPressure)  — barometer
-  - /imu/euler         (geometry_msgs/Vector3Stamped) — roll/pitch/yaw in radians (debug)
+  - imu/data          (sensor_msgs/Imu)        — quaternion, angular vel, linear accel
+  - imu/mag           (sensor_msgs/MagneticField) — magnetometer XYZ
+  - imu/pressure      (sensor_msgs/FluidPressure)  — barometer
+  - imu/euler         (geometry_msgs/Vector3Stamped) — roll/pitch/yaw in radians (debug)
 
 The CH100 uses:
   Body frame:  Right-Forward-Up (RFU)  — compatible with ROS REP-103
@@ -293,7 +293,7 @@ class HwClockSync:
 
     # Skip EMA update if the observed offset deviates from the filtered value
     # by more than this — indicates high serial-read latency, not true drift.
-    _MAX_RESIDUAL_NS = 5_000_000    # 5 ms
+    _MAX_RESIDUAL_NS = 5_000_000  # 5 ms
 
     # uint32 ms counter full range in nanoseconds (for wraparound compensation)
     _WRAP_PERIOD_NS = (1 << 32) * 1_000_000
@@ -323,7 +323,7 @@ class HwClockSync:
         # -- Bootstrap on first frame -------------------------------------
         if self._filtered_offset_ns is None:
             self._filtered_offset_ns = float(ros_now_ns - hw_ns)
-            return ros_now_ns   # first frame: use wall clock directly
+            return ros_now_ns  # first frame: use wall clock directly
 
         # -- EMA update with residual gate --------------------------------
         observed_offset = ros_now_ns - hw_ns
@@ -341,8 +341,8 @@ class HwClockSync:
 #   B(1) + H(2) + b(1) + f(4) = 8 bytes before the uint32 field.
 # Extracted here without a full struct.unpack so the reader thread
 # can timestamp frames before the payload is fully parsed.
-_HW_TS_OFFSET = struct.calcsize("<BHbf")   # == 8
-_HW_TS_FMT    = struct.Struct("<I")        # uint32, little-endian
+_HW_TS_OFFSET = struct.calcsize("<BHbf")  # == 8
+_HW_TS_FMT = struct.Struct("<I")  # uint32, little-endian
 
 
 def _extract_hw_ms(payload: bytes) -> int:
@@ -362,7 +362,7 @@ class CH100ImuNode(Node):
         self.declare_parameter("port", "/dev/ttyUSB0")
         self.declare_parameter("baud_rate", 115200)
         self.declare_parameter("frame_id", "imu_link")
-        self.declare_parameter("publish_euler", True)  # debug topic
+        self.declare_parameter("publish_euler", False)  # debug topic
 
         port = self.get_parameter("port").value
         baud_rate = self.get_parameter("baud_rate").value
@@ -377,12 +377,12 @@ class CH100ImuNode(Node):
         )
 
         # -- Publishers --
-        self.pub_imu_ = self.create_publisher(Imu, "/imu/data", qos)
-        self.pub_mag_ = self.create_publisher(MagneticField, "/imu/mag", qos)
-        self.pub_pressure_ = self.create_publisher(FluidPressure, "/imu/pressure", qos)
+        self.pub_imu_ = self.create_publisher(Imu, "imu/data", qos)
+        self.pub_mag_ = self.create_publisher(MagneticField, "imu/mag", qos)
+        self.pub_pressure_ = self.create_publisher(FluidPressure, "imu/pressure", qos)
         if self.pub_euler_:
             self.pub_euler_msg_ = self.create_publisher(
-                Vector3Stamped, "/imu/euler", qos
+                Vector3Stamped, "imu/euler", qos
             )
 
         # -- Open serial port --
