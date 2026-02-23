@@ -41,43 +41,35 @@ from std_msgs.msg import Header
 
 import math
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Protocol constants
-# ─────────────────────────────────────────────────────────────────────────────
-FRAME_HEADER_1   = 0x5A
-FRAME_HEADER_2   = 0xA5
-PAYLOAD_LABEL    = 0x91
-HEADER_SIZE      = 6          # 0x5A + 0xA5 + 2-byte LEN + 2-byte CRC
-PAYLOAD_SIZE     = 76         # fixed for 0x91 packet
+# -----------------------------------------------------------------------------
+FRAME_HEADER_1 = 0x5A
+FRAME_HEADER_2 = 0xA5
+PAYLOAD_LABEL = 0x91
+HEADER_SIZE = 6  # 0x5A + 0xA5 + 2-byte LEN + 2-byte CRC
+PAYLOAD_SIZE = 76  # fixed for 0x91 packet
 TOTAL_FRAME_SIZE = HEADER_SIZE + PAYLOAD_SIZE  # 82 bytes
 
-G_TO_MS2   = 9.80665          # 1 G in m/s²
+G_TO_MS2 = 9.80665  # 1 G in m/s²
 DEG_TO_RAD = math.pi / 180.0
-UT_TO_T    = 1e-6             # µT → Tesla
+UT_TO_T = 1e-6  # µT → Tesla
 
 # Covariance matrices — adjust these to match your calibration data.
 # Using -1.0 as the first element means "unknown" per REP-147.
-ORIENTATION_COVAR  = [1e-4, 0.0, 0.0,
-                      0.0, 1e-4, 0.0,
-                      0.0, 0.0, 1e-4]
+ORIENTATION_COVAR = [1e-4, 0.0, 0.0, 0.0, 1e-4, 0.0, 0.0, 0.0, 1e-4]
 
-ANGULAR_VEL_COVAR  = [1e-6, 0.0, 0.0,
-                      0.0, 1e-6, 0.0,
-                      0.0, 0.0, 1e-6]
+ANGULAR_VEL_COVAR = [1e-6, 0.0, 0.0, 0.0, 1e-6, 0.0, 0.0, 0.0, 1e-6]
 
-LINEAR_ACCEL_COVAR = [1e-4, 0.0, 0.0,
-                      0.0, 1e-4, 0.0,
-                      0.0, 0.0, 1e-4]
+LINEAR_ACCEL_COVAR = [1e-4, 0.0, 0.0, 0.0, 1e-4, 0.0, 0.0, 0.0, 1e-4]
 
-MAG_COVAR          = [1e-9, 0.0, 0.0,
-                      0.0, 1e-9, 0.0,
-                      0.0, 0.0, 1e-9]
+MAG_COVAR = [1e-9, 0.0, 0.0, 0.0, 1e-9, 0.0, 0.0, 0.0, 1e-9]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # CRC-16/CCITT  (polynomial 0x1021, initial value 0x0000)
 # Matches the C implementation in the CH100 manual exactly.
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def crc16_update(crc: int, data: bytes) -> int:
     """Update a running CRC-16/CCITT value with new bytes."""
     for byte in data:
@@ -86,7 +78,7 @@ def crc16_update(crc: int, data: bytes) -> int:
             temp = crc << 1
             if crc & 0x8000:
                 temp ^= 0x1021
-            crc = temp & 0xFFFF   # keep to 16 bits
+            crc = temp & 0xFFFF  # keep to 16 bits
     return crc
 
 
@@ -96,14 +88,14 @@ def compute_frame_crc(header_bytes: bytes, payload_bytes: bytes) -> int:
     That is bytes [0..3] of the frame header block plus the full payload.
     The two CRC bytes themselves are excluded.
     """
-    crc = crc16_update(0, header_bytes)   # 4 bytes: 0x5A 0xA5 LEN_L LEN_H
+    crc = crc16_update(0, header_bytes)  # 4 bytes: 0x5A 0xA5 LEN_L LEN_H
     crc = crc16_update(crc, payload_bytes)
     return crc
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Packet parser
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def parse_payload(payload: bytes) -> dict:
     """
     Unpack a 76-byte 0x91 IMUSOL payload into a plain dict.
@@ -120,76 +112,96 @@ def parse_payload(payload: bytes) -> dict:
     # 3f = float32 × 3 (mag µT)
     # 3f = float32 × 3 (euler °: roll, pitch, yaw)
     # 4f = float32 × 4 (quaternion: w, x, y, z)
-    fmt = '<BB2xfI3f3f3f3f4f'
+    fmt = "<BB2xfI3f3f3f3f4f"
     expected = struct.calcsize(fmt)  # should be 76
-    assert expected == PAYLOAD_SIZE, f"Struct size mismatch: {expected} != {PAYLOAD_SIZE}"
+    assert (
+        expected == PAYLOAD_SIZE
+    ), f"Struct size mismatch: {expected} != {PAYLOAD_SIZE}"
 
     fields = struct.unpack(fmt, payload)
-    (label, mod_id,
-     pressure_pa, timestamp_ms,
-     ax, ay, az,
-     gx, gy, gz,
-     mx, my, mz,
-     roll_deg, pitch_deg, yaw_deg,
-     qw, qx, qy, qz) = fields
+    (
+        label,
+        mod_id,
+        pressure_pa,
+        timestamp_ms,
+        ax,
+        ay,
+        az,
+        gx,
+        gy,
+        gz,
+        mx,
+        my,
+        mz,
+        roll_deg,
+        pitch_deg,
+        yaw_deg,
+        qw,
+        qx,
+        qy,
+        qz,
+    ) = fields
 
     return {
-        'label':       label,
-        'id':          mod_id,
+        "label": label,
+        "id": mod_id,
         # Pressure — keep as Pa (SI)
-        'pressure_pa': pressure_pa,
+        "pressure_pa": pressure_pa,
         # Timestamp in seconds
-        'timestamp_s': timestamp_ms * 1e-3,
+        "timestamp_s": timestamp_ms * 1e-3,
         # Acceleration: G → m/s²
-        'accel_ms2':   (ax * G_TO_MS2, ay * G_TO_MS2, az * G_TO_MS2),
+        "accel_ms2": (ax * G_TO_MS2, ay * G_TO_MS2, az * G_TO_MS2),
         # Angular velocity: °/s → rad/s
-        'gyro_rads':   (gx * DEG_TO_RAD, gy * DEG_TO_RAD, gz * DEG_TO_RAD),
+        "gyro_rads": (gx * DEG_TO_RAD, gy * DEG_TO_RAD, gz * DEG_TO_RAD),
         # Magnetometer: µT → Tesla
-        'mag_t':       (mx * UT_TO_T,   my * UT_TO_T,   mz * UT_TO_T),
+        "mag_t": (mx * UT_TO_T, my * UT_TO_T, mz * UT_TO_T),
         # Euler angles: ° → rad (for convenience; quaternion is preferred)
-        'euler_rad':   (roll_deg * DEG_TO_RAD,
-                        pitch_deg * DEG_TO_RAD,
-                        yaw_deg * DEG_TO_RAD),
+        "euler_rad": (
+            roll_deg * DEG_TO_RAD,
+            pitch_deg * DEG_TO_RAD,
+            yaw_deg * DEG_TO_RAD,
+        ),
         # Quaternion (already dimensionless)
-        'quat_wxyz':   (qw, qx, qy, qz),
+        "quat_wxyz": (qw, qx, qy, qz),
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # ROS2 Node
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 class CH100ImuNode(Node):
 
     def __init__(self):
-        super().__init__('ch100_imu_node')
+        super().__init__("ch100_imu_node")
 
-        # ── Declare parameters (can be overridden via launch args or YAML) ──
-        self.declare_parameter('port',       '/dev/ttyUSB0')
-        self.declare_parameter('baud_rate',  115200)
-        self.declare_parameter('frame_id',   'imu_link')
-        self.declare_parameter('publish_euler', True)   # debug topic
+        # -- Declare parameters (can be overridden via launch args or YAML) --
+        self.declare_parameter("port", "/dev/ttyUSB0")
+        self.declare_parameter("baud_rate", 115200)
+        self.declare_parameter("frame_id", "imu_link")
+        self.declare_parameter("publish_euler", True)  # debug topic
 
-        port      = self.get_parameter('port').value
-        baud_rate = self.get_parameter('baud_rate').value
-        self.frame_id_     = self.get_parameter('frame_id').value
-        self.pub_euler_    = self.get_parameter('publish_euler').value
+        port = self.get_parameter("port").value
+        baud_rate = self.get_parameter("baud_rate").value
+        self.frame_id_ = self.get_parameter("frame_id").value
+        self.pub_euler_ = self.get_parameter("publish_euler").value
 
-        # ── QoS — sensor data: best-effort, keep last 10 ──
+        # -- QoS — sensor data: best-effort, keep last 10 --
         qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST,
-            depth=10
+            depth=10,
         )
 
-        # ── Publishers ──
-        self.pub_imu_      = self.create_publisher(Imu,            '/imu/data',     qos)
-        self.pub_mag_      = self.create_publisher(MagneticField,  '/imu/mag',      qos)
-        self.pub_pressure_ = self.create_publisher(FluidPressure,  '/imu/pressure', qos)
+        # -- Publishers --
+        self.pub_imu_ = self.create_publisher(Imu, "/imu/data", qos)
+        self.pub_mag_ = self.create_publisher(MagneticField, "/imu/mag", qos)
+        self.pub_pressure_ = self.create_publisher(FluidPressure, "/imu/pressure", qos)
         if self.pub_euler_:
             self.pub_euler_msg_ = self.create_publisher(
-                Vector3Stamped, '/imu/euler', qos)
+                Vector3Stamped, "/imu/euler", qos
+            )
 
-        # ── Open serial port ──
+        # -- Open serial port --
         try:
             self.serial_ = serial.Serial(
                 port=port,
@@ -197,77 +209,78 @@ class CH100ImuNode(Node):
                 bytesize=serial.EIGHTBITS,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
-                timeout=1.0          # 1 s read timeout
+                timeout=1.0,  # 1 s read timeout
             )
-            self.get_logger().info(
-                f'Opened serial port {port} at {baud_rate} baud.')
+            self.get_logger().info(f"Opened serial port {port} at {baud_rate} baud.")
         except serial.SerialException as e:
-            self.get_logger().fatal(f'Failed to open serial port: {e}')
+            self.get_logger().fatal(f"Failed to open serial port: {e}")
             raise
 
-        # ── Statistics ──
-        self.frames_ok_   = 0
-        self.frames_bad_  = 0
+        # -- Statistics --
+        self.frames_ok_ = 0
+        self.frames_bad_ = 0
 
-        # ── Timer-driven read loop (runs at ~1 kHz, i.e., faster than 400 Hz ODR) ──
+        # -- Timer-driven read loop (runs at ~1 kHz, i.e., faster than 400 Hz ODR) --
         self.timer_ = self.create_timer(0.001, self.read_and_publish)
 
-        self.get_logger().info('CH100 IMU node started.')
+        self.get_logger().info("CH100 IMU node started.")
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
     def read_and_publish(self):
         """Called by the ROS timer. Reads one complete frame and publishes it."""
         try:
             if not self._sync_to_frame_header():
-                return   # timed-out waiting for header — try next tick
+                return  # timed-out waiting for header — try next tick
 
             # Read remaining 4 header bytes: LEN_L, LEN_H, CRC_L, CRC_H
             rest_header = self.serial_.read(4)
             if len(rest_header) < 4:
-                self.get_logger().warn('Incomplete header read — skipping frame.')
+                self.get_logger().warn("Incomplete header read — skipping frame.")
                 self.frames_bad_ += 1
                 return
 
             payload_len = rest_header[0] | (rest_header[1] << 8)
-            frame_crc   = rest_header[2] | (rest_header[3] << 8)
+            frame_crc = rest_header[2] | (rest_header[3] << 8)
 
             if payload_len != PAYLOAD_SIZE:
                 self.get_logger().warn(
-                    f'Unexpected payload length {payload_len}, expected {PAYLOAD_SIZE}.'
-                    ' Re-syncing.')
+                    f"Unexpected payload length {payload_len}, expected {PAYLOAD_SIZE}."
+                    " Re-syncing."
+                )
                 self.frames_bad_ += 1
                 return
 
             # Read payload
             payload = self.serial_.read(payload_len)
             if len(payload) < payload_len:
-                self.get_logger().warn('Incomplete payload read — skipping frame.')
+                self.get_logger().warn("Incomplete payload read — skipping frame.")
                 self.frames_bad_ += 1
                 return
 
             # Verify CRC
             # header_crc_input = the first 4 bytes the CRC covers:
             #   0x5A, 0xA5, LEN_L, LEN_H
-            header_crc_input = bytes([FRAME_HEADER_1, FRAME_HEADER_2,
-                                      rest_header[0], rest_header[1]])
+            header_crc_input = bytes(
+                [FRAME_HEADER_1, FRAME_HEADER_2, rest_header[0], rest_header[1]]
+            )
             computed_crc = compute_frame_crc(header_crc_input, payload)
             if computed_crc != frame_crc:
                 self.get_logger().warn(
-                    f'CRC mismatch: computed 0x{computed_crc:04X}, '
-                    f'got 0x{frame_crc:04X} — dropping frame.')
+                    f"CRC mismatch: computed 0x{computed_crc:04X}, "
+                    f"got 0x{frame_crc:04X} — dropping frame."
+                )
                 self.frames_bad_ += 1
                 return
 
             # Verify packet label
             if payload[0] != PAYLOAD_LABEL:
-                self.get_logger().warn(
-                    f'Unexpected packet label 0x{payload[0]:02X}.')
+                self.get_logger().warn(f"Unexpected packet label 0x{payload[0]:02X}.")
                 self.frames_bad_ += 1
                 return
 
             # Parse and publish
             data = parse_payload(payload)
-            now  = self.get_clock().now().to_msg()
+            now = self.get_clock().now().to_msg()
             self._publish_imu(data, now)
             self._publish_mag(data, now)
             self._publish_pressure(data, now)
@@ -275,14 +288,15 @@ class CH100ImuNode(Node):
                 self._publish_euler(data, now)
 
             self.frames_ok_ += 1
-            if self.frames_ok_ % 500 == 0:   # log every 500 good frames
+            if self.frames_ok_ % 500 == 0:  # log every 500 good frames
                 self.get_logger().info(
-                    f'Frames OK: {self.frames_ok_}  Bad: {self.frames_bad_}')
+                    f"Frames OK: {self.frames_ok_}  Bad: {self.frames_bad_}"
+                )
 
         except serial.SerialException as e:
-            self.get_logger().error(f'Serial error: {e}')
+            self.get_logger().error(f"Serial error: {e}")
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
     def _sync_to_frame_header(self) -> bool:
         """
         Scan the byte stream until we see [0x5A, 0xA5] (2-byte frame header).
@@ -296,32 +310,32 @@ class CH100ImuNode(Node):
             return False
         return True
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
     def _make_header(self, stamp) -> Header:
         h = Header()
-        h.stamp    = stamp
+        h.stamp = stamp
         h.frame_id = self.frame_id_
         return h
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
     def _publish_imu(self, data: dict, stamp):
         msg = Imu()
         msg.header = self._make_header(stamp)
 
-        qw, qx, qy, qz = data['quat_wxyz']
+        qw, qx, qy, qz = data["quat_wxyz"]
         msg.orientation.w = qw
         msg.orientation.x = qx
         msg.orientation.y = qy
         msg.orientation.z = qz
         msg.orientation_covariance = ORIENTATION_COVAR
 
-        gx, gy, gz = data['gyro_rads']
+        gx, gy, gz = data["gyro_rads"]
         msg.angular_velocity.x = gx
         msg.angular_velocity.y = gy
         msg.angular_velocity.z = gz
         msg.angular_velocity_covariance = ANGULAR_VEL_COVAR
 
-        ax, ay, az = data['accel_ms2']
+        ax, ay, az = data["accel_ms2"]
         msg.linear_acceleration.x = ax
         msg.linear_acceleration.y = ay
         msg.linear_acceleration.z = az
@@ -329,12 +343,12 @@ class CH100ImuNode(Node):
 
         self.pub_imu_.publish(msg)
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
     def _publish_mag(self, data: dict, stamp):
         msg = MagneticField()
         msg.header = self._make_header(stamp)
 
-        mx, my, mz = data['mag_t']
+        mx, my, mz = data["mag_t"]
         msg.magnetic_field.x = mx
         msg.magnetic_field.y = my
         msg.magnetic_field.z = mz
@@ -342,35 +356,35 @@ class CH100ImuNode(Node):
 
         self.pub_mag_.publish(msg)
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
     def _publish_pressure(self, data: dict, stamp):
         msg = FluidPressure()
-        msg.header          = self._make_header(stamp)
-        msg.fluid_pressure  = data['pressure_pa']   # already in Pa
-        msg.variance        = 0.0                   # unknown; set if calibrated
+        msg.header = self._make_header(stamp)
+        msg.fluid_pressure = data["pressure_pa"]  # already in Pa
+        msg.variance = 0.0  # unknown; set if calibrated
         self.pub_pressure_.publish(msg)
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
     def _publish_euler(self, data: dict, stamp):
         """Convenience debug topic: roll / pitch / yaw in radians."""
         msg = Vector3Stamped()
-        msg.header  = self._make_header(stamp)
-        roll, pitch, yaw = data['euler_rad']
+        msg.header = self._make_header(stamp)
+        roll, pitch, yaw = data["euler_rad"]
         msg.vector.x = roll
         msg.vector.y = pitch
         msg.vector.z = yaw
         self.pub_euler_msg_.publish(msg)
 
-    # ──────────────────────────────────────────────────────────────────────────
+    # --------------------------------------------------------------------------
     def destroy_node(self):
         """Clean up the serial port on shutdown."""
-        if hasattr(self, 'serial_') and self.serial_.is_open:
+        if hasattr(self, "serial_") and self.serial_.is_open:
             self.serial_.close()
-            self.get_logger().info('Serial port closed.')
+            self.get_logger().info("Serial port closed.")
         super().destroy_node()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 def main(args=None):
     rclpy.init(args=args)
     node = CH100ImuNode()
@@ -383,5 +397,5 @@ def main(args=None):
         rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
