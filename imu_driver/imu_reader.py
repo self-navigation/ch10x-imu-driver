@@ -4,14 +4,14 @@ CH100 IMU ROS2 Driver Node
 (With updates from C++ upstream https://github.com/hipnuc/products/tree/dddc5d46add235d848d860a326eab8ee5f66c919/examples/ROS2)
 
 Reads binary 0x91 IMUSOL frames from the CH100 over serial and publishes:
-  - imu/data          (sensor_msgs/Imu)        — quaternion, angular vel, linear accel
-  - imu/mag           (sensor_msgs/MagneticField) — magnetometer XYZ
-  - imu/pressure      (sensor_msgs/FluidPressure)  — barometer
-  - imu/euler         (geometry_msgs/Vector3Stamped) — roll/pitch/yaw in radians (debug)
+  - imu/data          (sensor_msgs/Imu)        - quaternion, angular vel, linear accel
+  - imu/mag           (sensor_msgs/MagneticField) - magnetometer XYZ
+  - imu/pressure      (sensor_msgs/FluidPressure)  - barometer
+  - imu/euler         (geometry_msgs/Vector3Stamped) - roll/pitch/yaw in radians (debug)
 
 The CH100 uses:
-  Body frame:  Right-Forward-Up (RFU)  — compatible with ROS REP-103
-  World frame: East-North-Up   (ENU)  — compatible with ROS REP-103
+  Body frame:  Right-Forward-Up (RFU)  - compatible with ROS REP-103
+  World frame: East-North-Up   (ENU)  - compatible with ROS REP-103
 
 Frame wire format (82 bytes total):
   [0x5A][0xA5][LEN_L][LEN_H][CRC_L][CRC_H][ ... 76-byte payload ... ]
@@ -19,8 +19,8 @@ Frame wire format (82 bytes total):
 
 Payload (0x91 packet, 76 bytes):
   Offset  Type       Size  Unit       Field
-  0       uint8      1     —          Packet label (0x91)
-  1-2     uint16     2     —          Main status flags
+  0       uint8      1     -          Packet label (0x91)
+  1-2     uint16     2     -          Main status flags
   3       int8       1     °C         Temperature
   4-7     float32    4     Pa         Air pressure
   8-11    uint32     4     ms         Timestamp since power-on
@@ -28,7 +28,7 @@ Payload (0x91 packet, 76 bytes):
   24-35   float32×3  12    °/s        Angular velocity XYZ
   36-47   float32×3  12    µT         Magnetic field XYZ
   48-59   float32×3  12    °          Euler angles: Roll, Pitch, Yaw
-  60-75   float32×4  16    —          Quaternion: W, X, Y, Z
+  60-75   float32×4  16    -          Quaternion: W, X, Y, Z
 """
 
 import struct
@@ -61,7 +61,7 @@ G_TO_MS2 = 9.80665  # 1 G in m/s²
 DEG_TO_RAD = math.pi / 180.0
 UT_TO_T = 1e-6  # µT → Tesla
 
-# Covariance matrices — adjust these to match your calibration data.
+# Covariance matrices - adjust these to match your calibration data.
 # Using -1.0 as the first element means "unknown" per REP-147.
 ORIENTATION_COVAR = [1e-4, 0.0, 0.0, 0.0, 1e-4, 0.0, 0.0, 0.0, 1e-4]
 
@@ -89,7 +89,7 @@ def crc16_update(crc: int, data: bytes) -> int:
 
 
 # -----------------------------------------------------------------------------
-# HiPNUC frame decoder — byte-by-byte state machine
+# HiPNUC frame decoder - byte-by-byte state machine
 # https://github.com/hipnuc/products/blob/dddc5d46add235d848d860a326eab8ee5f66c919/examples/ROS2/hipnuc_ws/src/hipnuc_lib_package/src/hipnuc_dec.c
 #
 # Direct Python translation of hipnuc_input() + decode_hipnuc() from
@@ -104,7 +104,7 @@ class HipnucDecoder:
     _MAX_SIZE = 512  # matches HIPNUC_MAX_RAW_SIZE in hipnuc_dec.h
 
     def __init__(self):
-        # Internal accumulation buffer — pre-allocated like the C struct
+        # Internal accumulation buffer - pre-allocated like the C struct
         self._buf = bytearray(self._MAX_SIZE)
         # Number of bytes currently buffered (0 means waiting for sync)
         self._nbyte = 0
@@ -128,7 +128,7 @@ class HipnucDecoder:
             self._buf[0] = self._buf[1]
             self._buf[1] = byte
             if self._buf[0] == self._SYNC1 and self._buf[1] == self._SYNC2:
-                # Sync found — start accumulating from byte 2
+                # Sync found - start accumulating from byte 2
                 self._nbyte = 2
             return None
 
@@ -140,7 +140,7 @@ class HipnucDecoder:
         if self._nbyte == self._HEADER_SIZE:
             self._len = self._buf[2] | (self._buf[3] << 8)
             if self._len > self._MAX_SIZE - self._HEADER_SIZE:
-                # Declared length is insane — almost certainly a missed sync
+                # Declared length is insane - almost certainly a missed sync
                 self._nbyte = 0
                 return None
 
@@ -150,7 +150,7 @@ class HipnucDecoder:
         if self._nbyte < self._HEADER_SIZE + self._len:
             return None
 
-        # -- Frame complete — verify CRC then hand off payload -------------
+        # -- Frame complete - verify CRC then hand off payload -------------
         # Reset nbyte first so re-sync starts immediately on any failure
         self._nbyte = 0
 
@@ -161,8 +161,8 @@ class HipnucDecoder:
         Verify CRC and return the payload slice, or None on failure.
 
         CRC covers:
-          buf[0..3]  — sync bytes + length field  (excludes the CRC field itself)
-          buf[6..]   — payload
+          buf[0..3]  - sync bytes + length field  (excludes the CRC field itself)
+          buf[6..]   - payload
         This matches decode_hipnuc() in hipnuc_dec.c exactly.
         """
         payload_len = self._len
@@ -236,7 +236,7 @@ def parse_payload(payload: bytes) -> dict:
         "label": label,
         "main_status": main_status,
         "temp_c": temp_c,
-        # Pressure — keep as Pa (SI)
+        # Pressure - keep as Pa (SI)
         "pressure_pa": pressure_pa,
         # Timestamp in seconds
         "timestamp_s": timestamp_ms * 1e-3,
@@ -270,7 +270,7 @@ class HwClockSync:
     by up to ±50 ppm, so a naive one-shot offset computed at startup drifts
     by up to ~4 ms/min.
 
-    Strategy — offset EMA with a residual gate:
+    Strategy - offset EMA with a residual gate:
 
       offset_ns  =  ros_now_ns  −  hw_ns          (new observation)
       filtered   +=  α × (offset_ns − filtered)   (EMA update)
@@ -287,12 +287,12 @@ class HwClockSync:
     to the previous frame.
     """
 
-    # EMA coefficient — time constant ≈ 1/α frames.
+    # EMA coefficient - time constant ≈ 1/α frames.
     # At 100 Hz → ~5 s settling; at 400 Hz → ~1.25 s settling.
     _ALPHA = 0.002
 
     # Skip EMA update if the observed offset deviates from the filtered value
-    # by more than this — indicates high serial-read latency, not true drift.
+    # by more than this - indicates high serial-read latency, not true drift.
     _MAX_RESIDUAL_NS = 5_000_000  # 5 ms
 
     # uint32 ms counter full range in nanoseconds (for wraparound compensation)
@@ -307,8 +307,8 @@ class HwClockSync:
         """
         Returns a corrected ROS timestamp in nanoseconds.
 
-        hw_ms      — raw uint32 millisecond counter from the IMU payload
-        ros_now_ns — result of node.get_clock().now().nanoseconds, taken
+        hw_ms      - raw uint32 millisecond counter from the IMU payload
+        ros_now_ns - result of node.get_clock().now().nanoseconds, taken
                      immediately after the last byte of the frame was decoded
         """
         # -- Wraparound detection -----------------------------------------
@@ -369,7 +369,7 @@ class CH100ImuNode(Node):
         self.frame_id_ = self.get_parameter("frame_id").value
         self.pub_euler_ = self.get_parameter("publish_euler").value
 
-        # -- QoS — sensor data: best-effort, keep last 10 --
+        # -- QoS - sensor data: best-effort, keep last 10 --
         qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -400,7 +400,7 @@ class CH100ImuNode(Node):
             self.get_logger().fatal(f"Failed to open serial port: {e}")
             raise
 
-        # -- Frame decoder (state machine — owned by the reader thread) --
+        # -- Frame decoder (state machine - owned by the reader thread) --
         self.decoder_ = HipnucDecoder()
 
         # -- Hardware clock synchroniser ----------------------------------
@@ -418,7 +418,7 @@ class CH100ImuNode(Node):
         # as close to receipt as possible.
         self._frame_queue = queue.SimpleQueue()
 
-        # -- Stop event — set by destroy_node() to unblock the reader thread --
+        # -- Stop event - set by destroy_node() to unblock the reader thread --
         self._stop_event = threading.Event()
 
         # -- Serial reader thread ------------------------------------------
@@ -431,7 +431,7 @@ class CH100ImuNode(Node):
         )
         self._reader_thread.start()
 
-        # -- Publisher timer — drains the frame queue in the executor thread --
+        # -- Publisher timer - drains the frame queue in the executor thread --
         # Period is set to match the maximum ODR (400 Hz → 2.5 ms).
         self.timer_ = self.create_timer(0.0025, self._publish_pending)
 
@@ -455,7 +455,7 @@ class CH100ImuNode(Node):
             try:
                 data = self.serial_.read(1)
                 if not data:
-                    continue  # read timeout (serial timeout=1.0 s) — loop and recheck
+                    continue  # read timeout (serial timeout=1.0 s) - loop and recheck
 
                 payload = self.decoder_.input(data[0])
                 if payload is None:
@@ -463,7 +463,7 @@ class CH100ImuNode(Node):
 
                 # -- Complete, CRC-verified frame --------------------------
                 # Wall-clock sample taken immediately after the last byte was
-                # decoded — as close to receipt as possible.  Passed to
+                # decoded - as close to receipt as possible.  Passed to
                 # HwClockSync together with the IMU's own hardware timestamp
                 # to produce a corrected, jitter-filtered ROS stamp.
                 ros_now_ns = self.get_clock().now().nanoseconds
@@ -471,14 +471,14 @@ class CH100ImuNode(Node):
                 if len(payload) != PAYLOAD_SIZE:
                     self.get_logger().warn(
                         f"Unexpected payload length {len(payload)}, "
-                        f"expected {PAYLOAD_SIZE} — skipping."
+                        f"expected {PAYLOAD_SIZE} - skipping."
                     )
                     self.frames_bad_ += 1
                     continue
 
                 if payload[0] != PAYLOAD_LABEL:
                     self.get_logger().warn(
-                        f"Unexpected packet label 0x{payload[0]:02X} — skipping."
+                        f"Unexpected packet label 0x{payload[0]:02X} - skipping."
                     )
                     self.frames_bad_ += 1
                     continue
