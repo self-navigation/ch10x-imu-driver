@@ -82,15 +82,98 @@ def crc16_update(crc: int, data: bytes) -> int:
     return crc
 
 
-def compute_frame_crc(header_bytes: bytes, payload_bytes: bytes) -> int:
-    """
-    CRC covers: frame_header + frame_type + length_field + payload.
-    That is bytes [0..3] of the frame header block plus the full payload.
-    The two CRC bytes themselves are excluded.
-    """
-    crc = crc16_update(0, header_bytes)  # 4 bytes: 0x5A 0xA5 LEN_L LEN_H
-    crc = crc16_update(crc, payload_bytes)
-    return crc
+# -----------------------------------------------------------------------------
+# HiPNUC frame decoder — byte-by-byte state machine
+# https://github.com/hipnuc/products/blob/dddc5d46add235d848d860a326eab8ee5f66c919/examples/ROS2/hipnuc_ws/src/hipnuc_lib_package/src/hipnuc_dec.c
+#
+# Direct Python translation of hipnuc_input() + decode_hipnuc() from
+# hipnuc_dec.c.  Feed one byte at a time via input(); it returns the
+# raw payload bytes when a complete, CRC-verified frame has arrived,
+# or None otherwise.
+# -----------------------------------------------------------------------------
+class HipnucDecoder:
+    _SYNC1 = 0x5A
+    _SYNC2 = 0xA5
+    _HEADER_SIZE = 6  # sync(2) + len(2) + crc(2)
+    _MAX_SIZE = 512  # matches HIPNUC_MAX_RAW_SIZE in hipnuc_dec.h
+
+    def __init__(self):
+        # Internal accumulation buffer — pre-allocated like the C struct
+        self._buf = bytearray(self._MAX_SIZE)
+        # Number of bytes currently buffered (0 means waiting for sync)
+        self._nbyte = 0
+        # Declared payload length extracted from the length field
+        self._len = 0
+
+    def input(self, byte: int) -> bytes | None:
+        """
+        Process one byte from the serial stream.
+
+        Returns:
+            bytes: the validated payload (length == self._len) if this byte
+                   completed a good frame.
+            None:  still accumulating, or the frame failed validation.
+        """
+        if self._nbyte == 0:
+            # -- Sync phase: maintain a 2-byte sliding window --------------
+            # Equivalent to sync_hipnuc() in hipnuc_dec.c:
+            #   buf[0] = buf[1]; buf[1] = data;
+            #   return buf[0] == CHSYNC1 && buf[1] == CHSYNC2;
+            self._buf[0] = self._buf[1]
+            self._buf[1] = byte
+            if self._buf[0] == self._SYNC1 and self._buf[1] == self._SYNC2:
+                # Sync found — start accumulating from byte 2
+                self._nbyte = 2
+            return None
+
+        # -- Accumulation phase --------------------------------------------
+        self._buf[self._nbyte] = byte
+        self._nbyte += 1
+
+        # Once we have the full 6-byte header, extract the payload length
+        if self._nbyte == self._HEADER_SIZE:
+            self._len = self._buf[2] | (self._buf[3] << 8)
+            if self._len > self._MAX_SIZE - self._HEADER_SIZE:
+                # Declared length is insane — almost certainly a missed sync
+                self._nbyte = 0
+                return None
+
+        # Keep waiting until the complete frame (header + payload) is buffered
+        if self._nbyte < self._HEADER_SIZE:
+            return None
+        if self._nbyte < self._HEADER_SIZE + self._len:
+            return None
+
+        # -- Frame complete — verify CRC then hand off payload -------------
+        # Reset nbyte first so re-sync starts immediately on any failure
+        self._nbyte = 0
+
+        return self._verify_and_extract()
+
+    def _verify_and_extract(self) -> bytes | None:
+        """
+        Verify CRC and return the payload slice, or None on failure.
+
+        CRC covers:
+          buf[0..3]  — sync bytes + length field  (excludes the CRC field itself)
+          buf[6..]   — payload
+        This matches decode_hipnuc() in hipnuc_dec.c exactly.
+        """
+        payload_len = self._len
+
+        # Compute CRC over header bytes 0..3 and the full payload
+        crc = crc16_update(0, bytes(self._buf[:4]))
+        crc = crc16_update(
+            crc, bytes(self._buf[self._HEADER_SIZE : self._HEADER_SIZE + payload_len])
+        )
+
+        # CRC is stored at bytes 4..5, little-endian
+        frame_crc = self._buf[4] | (self._buf[5] << 8)
+
+        if crc != frame_crc:
+            return None  # caller increments bad-frame counter
+
+        return bytes(self._buf[self._HEADER_SIZE : self._HEADER_SIZE + payload_len])
 
 
 # -----------------------------------------------------------------------------
@@ -216,6 +299,9 @@ class CH100ImuNode(Node):
             self.get_logger().fatal(f"Failed to open serial port: {e}")
             raise
 
+        # -- Frame decoder (state machine — persists across timer callbacks) --
+        self.decoder_ = HipnucDecoder()
+
         # -- Statistics --
         self.frames_ok_ = 0
         self.frames_bad_ = 0
@@ -227,88 +313,62 @@ class CH100ImuNode(Node):
 
     # --------------------------------------------------------------------------
     def read_and_publish(self):
-        """Called by the ROS timer. Reads one complete frame and publishes it."""
+        """
+        Called by the ROS timer every 1 ms.
+
+        Reads all bytes currently waiting in the OS serial buffer and feeds
+        them through the HipnucDecoder state machine one byte at a time.
+        A single timer tick may produce zero, one, or multiple complete frames
+        (e.g., after a brief scheduling delay that let bytes pile up).
+        """
         try:
-            if not self._sync_to_frame_header():
-                return  # timed-out waiting for header — try next tick
-
-            # Read remaining 4 header bytes: LEN_L, LEN_H, CRC_L, CRC_H
-            rest_header = self.serial_.read(4)
-            if len(rest_header) < 4:
-                self.get_logger().warn("Incomplete header read — skipping frame.")
-                self.frames_bad_ += 1
+            available = self.serial_.in_waiting
+            if available == 0:
                 return
 
-            payload_len = rest_header[0] | (rest_header[1] << 8)
-            frame_crc = rest_header[2] | (rest_header[3] << 8)
+            chunk = self.serial_.read(available)
 
-            if payload_len != PAYLOAD_SIZE:
-                self.get_logger().warn(
-                    f"Unexpected payload length {payload_len}, expected {PAYLOAD_SIZE}."
-                    " Re-syncing."
-                )
-                self.frames_bad_ += 1
-                return
+            for byte in chunk:
+                payload = self.decoder_.input(byte)
 
-            # Read payload
-            payload = self.serial_.read(payload_len)
-            if len(payload) < payload_len:
-                self.get_logger().warn("Incomplete payload read — skipping frame.")
-                self.frames_bad_ += 1
-                return
+                if payload is None:
+                    continue  # state machine still accumulating
 
-            # Verify CRC
-            # header_crc_input = the first 4 bytes the CRC covers:
-            #   0x5A, 0xA5, LEN_L, LEN_H
-            header_crc_input = bytes(
-                [FRAME_HEADER_1, FRAME_HEADER_2, rest_header[0], rest_header[1]]
-            )
-            computed_crc = compute_frame_crc(header_crc_input, payload)
-            if computed_crc != frame_crc:
-                self.get_logger().warn(
-                    f"CRC mismatch: computed 0x{computed_crc:04X}, "
-                    f"got 0x{frame_crc:04X} — dropping frame."
-                )
-                self.frames_bad_ += 1
-                return
+                # -- Complete, CRC-verified frame --------------------------
+                if len(payload) != PAYLOAD_SIZE:
+                    # Unexpected payload length — decoder accepted it but it
+                    # doesn't match the 0x91 packet size we know how to parse
+                    self.get_logger().warn(
+                        f"Unexpected payload length {len(payload)}, "
+                        f"expected {PAYLOAD_SIZE} — skipping."
+                    )
+                    self.frames_bad_ += 1
+                    continue
 
-            # Verify packet label
-            if payload[0] != PAYLOAD_LABEL:
-                self.get_logger().warn(f"Unexpected packet label 0x{payload[0]:02X}.")
-                self.frames_bad_ += 1
-                return
+                if payload[0] != PAYLOAD_LABEL:
+                    self.get_logger().warn(
+                        f"Unexpected packet label 0x{payload[0]:02X} — skipping."
+                    )
+                    self.frames_bad_ += 1
+                    continue
 
-            # Parse and publish
-            data = parse_payload(payload)
-            now = self.get_clock().now().to_msg()
-            self._publish_imu(data, now)
-            self._publish_mag(data, now)
-            self._publish_pressure(data, now)
-            if self.pub_euler_:
-                self._publish_euler(data, now)
+                # Parse fields and publish all topics with the same stamp
+                data = parse_payload(payload)
+                now = self.get_clock().now().to_msg()
+                self._publish_imu(data, now)
+                self._publish_mag(data, now)
+                self._publish_pressure(data, now)
+                if self.pub_euler_:
+                    self._publish_euler(data, now)
 
-            self.frames_ok_ += 1
-            if self.frames_ok_ % 500 == 0:  # log every 500 good frames
-                self.get_logger().info(
-                    f"Frames OK: {self.frames_ok_}  Bad: {self.frames_bad_}"
-                )
+                self.frames_ok_ += 1
+                if self.frames_ok_ % 500 == 0:
+                    self.get_logger().info(
+                        f"Frames OK: {self.frames_ok_}  Bad: {self.frames_bad_}"
+                    )
 
         except serial.SerialException as e:
             self.get_logger().error(f"Serial error: {e}")
-
-    # --------------------------------------------------------------------------
-    def _sync_to_frame_header(self) -> bool:
-        """
-        Scan the byte stream until we see [0x5A, 0xA5] (2-byte frame header).
-        Returns True when positioned just after the header, False on timeout.
-        """
-        byte = self.serial_.read(1)
-        if not byte or byte[0] != FRAME_HEADER_1:
-            return False
-        byte = self.serial_.read(1)
-        if not byte or byte[0] != FRAME_HEADER_2:
-            return False
-        return True
 
     # --------------------------------------------------------------------------
     def _make_header(self, stamp) -> Header:
