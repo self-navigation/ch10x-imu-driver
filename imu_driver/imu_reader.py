@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 CH100 IMU ROS2 Driver Node
+(With updates from C++ upstream https://github.com/hipnuc/products/tree/dddc5d46add235d848d860a326eab8ee5f66c919/examples/ROS2)
+
 Reads binary 0x91 IMUSOL frames from the CH100 over serial and publishes:
   - /imu/data          (sensor_msgs/Imu)        — quaternion, angular vel, linear accel
   - /imu/mag           (sensor_msgs/MagneticField) — magnetometer XYZ
@@ -18,8 +20,8 @@ Frame wire format (82 bytes total):
 Payload (0x91 packet, 76 bytes):
   Offset  Type       Size  Unit       Field
   0       uint8      1     —          Packet label (0x91)
-  1       uint8      1     —          Module ID
-  2-3     —          2     —          Reserved
+  1-2     uint16     2     —          Main status flags
+  3       int8       1     °C         Temperature
   4-7     float32    4     Pa         Air pressure
   8-11    uint32     4     ms         Timestamp since power-on
   12-23   float32×3  12    G          Acceleration XYZ  (1G = 9.80665 m/s²)
@@ -184,10 +186,10 @@ def parse_payload(payload: bytes) -> dict:
     Unpack a 76-byte 0x91 IMUSOL payload into a plain dict.
     All unit conversions are done here so the ROS node stays clean.
     """
-    # Struct layout (little-endian):
-    # B  = uint8   (label)
-    # B  = uint8   (id)
-    # 2x = 2 padding bytes
+    # Struct layout (little-endian), matches hi91_t in hipnuc_dec.h exactly:
+    # B  = uint8   (label/tag)
+    # H  = uint16  (main_status)
+    # b  = int8    (temperature °C)
     # f  = float32 (pressure Pa)
     # I  = uint32  (timestamp ms)
     # 3f = float32 × 3 (accel G)
@@ -195,7 +197,7 @@ def parse_payload(payload: bytes) -> dict:
     # 3f = float32 × 3 (mag µT)
     # 3f = float32 × 3 (euler °: roll, pitch, yaw)
     # 4f = float32 × 4 (quaternion: w, x, y, z)
-    fmt = "<BB2xfI3f3f3f3f4f"
+    fmt = "<BHbfI3f3f3f3f4f"
     expected = struct.calcsize(fmt)  # should be 76
     assert (
         expected == PAYLOAD_SIZE
@@ -204,7 +206,8 @@ def parse_payload(payload: bytes) -> dict:
     fields = struct.unpack(fmt, payload)
     (
         label,
-        mod_id,
+        main_status,
+        temp_c,
         pressure_pa,
         timestamp_ms,
         ax,
@@ -227,7 +230,8 @@ def parse_payload(payload: bytes) -> dict:
 
     return {
         "label": label,
-        "id": mod_id,
+        "main_status": main_status,
+        "temp_c": temp_c,
         # Pressure — keep as Pa (SI)
         "pressure_pa": pressure_pa,
         # Timestamp in seconds
