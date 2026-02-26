@@ -575,13 +575,24 @@ class CH100ImuNode(Node):
 
     # --------------------------------------------------------------------------
     def _publish_euler(self, data: dict, stamp):
-        """Convenience debug topic: roll / pitch / yaw in radians."""
+        """
+        Convenience debug topic: roll / pitch / yaw in radians.
+
+        The CH100 uses a 3-1-2 (Z->X->Y) Euler sequence where it names the
+        rotation around X 'pitch' and around Y 'roll'.  REP-103 uses 3-2-1
+        (Z->Y->X) where roll is around X and pitch is around Y.  We swap here
+        so the published vector matches REP-103 expectations:
+          vector.x = roll  (rotation around X / forward)
+          vector.y = pitch (rotation around Y / left)
+          vector.z = yaw   (rotation around Z / up)
+        """
         msg = Vector3Stamped()
         msg.header = self._make_header(stamp)
-        roll, pitch, yaw = data["euler_rad"]
-        msg.vector.x = roll
-        msg.vector.y = pitch
-        msg.vector.z = yaw
+        ch100_roll, ch100_pitch, ch100_yaw = data["euler_rad"]
+        # Swap: CH100 roll (around Y) -> REP-103 pitch, CH100 pitch (around X) -> REP-103 roll
+        msg.vector.x = ch100_pitch  # REP-103 roll = rotation around forward
+        msg.vector.y = ch100_roll  # REP-103 pitch = rotation around left
+        msg.vector.z = ch100_yaw  # unchanged
         self.pub_euler_msg_.publish(msg)
 
     # --------------------------------------------------------------------------
